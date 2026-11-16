@@ -11,6 +11,7 @@ export interface GraphQLContext {
   scenario: Scenario;
   token: string;
   authed: boolean;
+  errors: string[];
 }
 
 export interface GraphQLResponse {
@@ -42,9 +43,11 @@ function parseSelections(source: string, start: number): { fields: Selection[]; 
     while (index < source.length && /\s/.test(source[index])) index += 1;
     if (source[index] === '}') return { fields, end: index + 1 };
     if (source[index] === '.') {
-      // inline fragment: skip "... on Type {" block
+      // inline fragment: "... on Type { ... }" — merge its selections into the parent scope.
       const braceAt = source.indexOf('{', index);
       const close = matchBrace(source, braceAt);
+      const parsed = parseSelections(source, braceAt + 1);
+      for (const field of parsed.fields) fields.push(field);
       index = close;
       continue;
     }
@@ -287,7 +290,7 @@ function pullGql(repo: Repo, pull: PullRequest): Record<string, unknown> {
     headRefOid: headTip,
     baseRefOid: baseTip,
     mergeable,
-    files: {},
+    files: { nodes: paths.map((entry) => ({ path: entry.path })), totalCount: paths.length },
     createdAt: pull.createdAt,
     author: { login: pull.user },
     _paths: paths,
@@ -426,6 +429,9 @@ function executeSelection(subject: unknown, fields: readonly Selection[], ctx: G
       continue;
     }
     if (value === undefined) {
+      if (!(field.name in record) && field.name !== '__typename') {
+        ctx.errors.push(`Field '${field.name}' doesn't exist on type '${record.__typename ?? 'Object'}'`);
+      }
       answer[key] = null;
       continue;
     }
@@ -670,7 +676,8 @@ export function handleGraphQL(ctx: GraphQLContext, payload: unknown): GraphQLRes
     }
     const outcome = executeOperation(parsed.operation, ctx);
     const body: Record<string, unknown> = { data: outcome.data };
-    if (outcome.errors.length > 0) body.errors = outcome.errors.map((message) => ({ message }));
+    const allErrors = [...outcome.errors, ...ctx.errors];
+    if (allErrors.length > 0) body.errors = allErrors.map((message) => ({ message }));
     responses.push(body);
   }
   return { status: 200, body: Array.isArray(payload) ? responses : responses[0] };

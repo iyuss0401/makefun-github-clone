@@ -100,6 +100,8 @@ function lsRefsReply(repo: Repo, store: Store, request: LsRefsRequest): Buffer {
   const headTarget = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
   if (headTarget === undefined && request.unborn) {
     parts.push(encodePktLine(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
+  } else if (headTarget !== undefined && request.prefixes.length === 0) {
+    parts.push(encodePktLine(`${headTarget} HEAD${request.symrefs ? ` symref-target:refs/heads/${repo.defaultBranch}` : ''}\n`));
   }
   for (const tip of store.refTips(repo)) {
     if (!keep(tip.ref)) continue;
@@ -107,11 +109,11 @@ function lsRefsReply(repo: Repo, store: Store, request: LsRefsRequest): Buffer {
     const isTag = object?.type === 'tag';
     let line = `${tip.oid} ${tip.ref}`;
     if (request.symrefs && tip.ref === 'HEAD' && headTarget !== undefined) line += ` symref-target:refs/heads/${repo.defaultBranch}`;
-    parts.push(encodePktLine(`${line}\n`));
     if (request.peel && isTag) {
       const peeled = store.peelCommit(repo, tip.oid);
-      if (peeled !== null) parts.push(encodePktLine(`${peeled} ${tip.ref} peeled:${peeled}\n`));
+      if (peeled !== null) line += ` peeled:${peeled}`;
     }
+    parts.push(encodePktLine(`${line}\n`));
   }
   parts.push(pktLineFlush());
   return Buffer.concat(parts);
@@ -161,65 +163,102 @@ function commitParents(store: Store, repo: Repo, oid: string): string[] | null {
   return parents;
 }
 
-/** Walk the commit graph from `tips`, bounded by `depth` (null = unlimited), skipping `haveSet`. */
-function walkForFetch(store: Store, repo: Repo, tips: readonly string[], depth: number | null, haveSet: ReadonlySet<string>): { commits: Set<string>; shallow: string[]; unshallow: string[] } {
-  const commits = new Set<string>();
+/** Walk every object reachable from `tips` (commits, trees, blobs, tags). */
+function reachableObjects(store: Store, repo: Repo, tips: readonly string[]): Set<string> {
+  const seen = new Set<string>();
+  const stack = [...tips];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    const object = store.get(repo, oid);
+    if (!object) continue;
+    seen.add(oid);
+    if (object.type === 'commit') {
+      const text = object.data.toString('utf8');
+      const treeAt = text.indexOf('tree ');
+      if (treeAt >= 0) stack.push(text.slice(treeAt + 5, text.indexOf('\n', treeAt)));
+      for (const parent of commitParents(store, repo, oid) ?? []) stack.push(parent);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTreeOf(object.data)) stack.push(entry.oid);
+    } else if (object.type === 'tag') {
+      const text = object.data.toString('utf8');
+      const at = text.indexOf('object ');
+      if (at >= 0) stack.push(text.slice(at + 7, text.indexOf('\n', at)));
+    }
+  }
+  return seen;
+}
+
+/**
+ * The objects a fetch replies with: the wanted tips (tags included, commits peeled), their trees and
+ * blobs, bounded by `depth`, minus everything reachable from what the client already holds.
+ */
+function fetchObjects(
+  store: Store,
+  repo: Repo,
+  wants: readonly string[],
+  depth: number | null,
+  heldTips: readonly string[],
+  shallowBoundaries: readonly string[] = [],
+): { objects: Map<string, GitObject>; shallow: string[] } {
+  const objects = new Map<string, GitObject>();
   const shallow: string[] = [];
-  const unshallow: string[] = [];
-  const depthOf = new Map<string, number>();
-  const queue: Array<{ oid: string; depth: number }> = [];
-  for (const tip of tips) queue.push({ oid: tip, depth: 1 });
-  while (queue.length) {
+  const startCommits: string[] = [];
+  for (const want of wants) {
+    const object = store.get(repo, want);
+    if (!object) continue;
+    if (object.type === 'tag') objects.set(want, object);
+    const commit = store.peelCommit(repo, want);
+    if (commit !== null) startCommits.push(commit);
+  }
+  const seen = new Set<string>();
+  const deepenHeld = new Set<string>(shallowBoundaries);
+  // Deepen: the client already holds each shallow boundary (depth 1 of its own clone). Deliver the
+  // boundary's parents (depth = request depth from the original tip) and mark their parents shallow.
+  const deepenMode = depth !== null && shallowBoundaries.length > 0;
+  const queue: Array<{ oid: string; depth: number }> = startCommits.map((oid) => ({ oid, depth: 1 }));
+  if (deepenMode) {
+    for (const oid of shallowBoundaries) {
+      const parents = commitParents(store, repo, oid);
+      if (parents === null) continue;
+      for (const parent of parents) queue.push({ oid: parent, depth });
+    }
+  }
+  while (queue.length > 0) {
     const { oid, depth: at } = queue.shift() as { oid: string; depth: number };
-    if (commits.has(oid)) {
-      const known = depthOf.get(oid);
-      if (known !== undefined && at < known) depthOf.set(oid, at);
-      continue;
-    }
-    if (haveSet.has(oid)) {
-      // The client holds it; acknowledge implicitly by not re-sending. Track unshallow when the
-      // client's shallow boundary turns out to have a parent here.
-      continue;
-    }
-    const parents = commitParents(store, repo, oid);
-    if (parents === null) continue;
-    commits.add(oid);
-    depthOf.set(oid, at);
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = store.get(repo, oid);
+    if (!object || object.type !== 'commit') continue;
+    objects.set(oid, object);
+    const parents = commitParents(store, repo, oid) ?? [];
     if (depth !== null && at >= depth) {
-      shallow.push(oid);
+      if (parents.length > 0 && !deepenHeld.has(oid)) shallow.push(oid);
       continue;
     }
     for (const parent of parents) queue.push({ oid: parent, depth: at + 1 });
   }
-  // unshallow: boundaries the client sent that now have parents within the new depth.
-  for (const boundary of haveSet) {
-    if (!commits.has(boundary)) continue;
-    void boundary;
-  }
-  return { commits, shallow, unshallow };
-}
-
-function collectObjects(store: Store, repo: Repo, commitOids: ReadonlySet<string>): Map<string, GitObject> {
-  const objects = new Map<string, GitObject>();
+  // Trees and blobs of every delivered commit.
   const addTree = (oid: string): void => {
+    if (objects.has(oid)) return;
     const object = store.get(repo, oid);
-    if (!object || objects.has(oid)) return;
+    if (!object) return;
     objects.set(oid, object);
     if (object.type !== 'tree') return;
-    for (const entry of ((): Array<{ oid: string }> => {
-      // inline parse via git-objects parseTree is imported transitively; use store parse
-      return parseTreeOf(object.data);
-    })()) addTree(entry.oid);
+    for (const entry of parseTreeOf(object.data)) addTree(entry.oid);
   };
-  for (const oid of commitOids) {
-    const object = store.get(repo, oid);
-    if (!object) continue;
-    objects.set(oid, object);
+  for (const oid of [...objects.keys()]) {
+    const object = objects.get(oid);
+    if (object?.type !== 'commit') continue;
     const text = object.data.toString('utf8');
     const treeAt = text.indexOf('tree ');
     if (treeAt >= 0) addTree(text.slice(treeAt + 5, text.indexOf('\n', treeAt)));
   }
-  return objects;
+  // Drop what the client already holds (a thin pack: real git sends nothing twice).
+  if (heldTips.length > 0) {
+    for (const oid of reachableObjects(store, repo, heldTips)) objects.delete(oid);
+  }
+  return { objects, shallow };
 }
 
 function parseTreeOf(data: Buffer): Array<{ oid: string }> {
@@ -259,33 +298,36 @@ export async function uploadPackV2(store: Store, repo: Repo, body: Buffer): Prom
 }
 
 function fetchReply(store: Store, repo: Repo, request: FetchRequest): { status: number; body: Buffer; contentType: string } {
-  const haveSet = new Set(request.haves);
   const wantedTips = request.wants.filter((oid) => store.get(repo, oid) !== undefined);
+  const haveSet = new Set(request.haves);
   const parts: Buffer[] = [];
   let shallow: string[] = [];
   let unshallow: string[] = [];
   let objects = new Map<string, GitObject>();
   if (wantedTips.length > 0) {
-    const walk = walkForFetch(store, repo, wantedTips, request.depth, haveSet);
-    shallow = walk.shallow;
-    objects = collectObjects(store, repo, walk.commits);
-    // Also include tag objects pointing at fetched commits and commits behind wants (all reachable
-    // non-commit objects hang off trees which collectObjects covers).
-    void unshallow;
-    void unshallow;
-    unshallow = [];
+    if (request.depth !== null) {
+      const boundaryTips = request.shallowBoundaries.filter((oid) => store.get(repo, oid) !== undefined);
+      const result = fetchObjects(store, repo, wantedTips, request.depth, request.haves, request.shallowBoundaries);
+      objects = result.objects;
+      shallow = result.shallow;
+      unshallow = boundaryTips.filter((oid) => commitParents(store, repo, oid) !== null);
+    } else {
+      const result = fetchObjects(store, repo, wantedTips, null, request.haves);
+      objects = result.objects;
+      shallow = result.shallow;
+    }
   }
   if (shallow.length > 0) {
     parts.push(pktText('shallow-info'));
     for (const oid of shallow) parts.push(pktText(`shallow ${oid}`));
+    for (const oid of unshallow) parts.push(pktText(`unshallow ${oid}`));
     parts.push(pktLineFlush());
   }
   parts.push(pktText('acknowledgments'));
-  // A client that sent haves which are all in our graph gets NAK-less ack; simplest: NAK.
   parts.push(pktText('NAK'));
   parts.push(pktLineFlush());
   parts.push(pktText('packfile'));
-  const pack = writePack(objects.values());
+  const pack = writePack([...objects.values()].map((object) => ({ type: object.type, data: object.data })));
   parts.push(sidebandFrames(pack));
   parts.push(pktLineFlush());
   return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-result' };
@@ -365,7 +407,7 @@ function reportLines(lines: string[], sideband: boolean): Buffer {
 export async function receivePack(store: Store, repo: Repo, body: Buffer): Promise<{ status: number; body: Buffer; contentType: string }> {
   const { commands, packData } = parseReceivePack(body);
   const sideband = true; // we always accept side-band-64k
-  const lines: string[] = [];
+  const lines: string[] = ['unpack ok\n'];
   let unpackOk = true;
   let unpackDetail = '';
   if (commands.some((command) => command.newOid !== ZERO_OID)) {
@@ -465,19 +507,29 @@ export async function uploadPackV0(store: Store, repo: Repo, body: Buffer): Prom
 }
 
 function fetchReplyV0(store: Store, repo: Repo, request: FetchRequest): { status: number; body: Buffer; contentType: string } {
-  const haveSet = new Set(request.haves);
   const wantedTips = request.wants.filter((oid) => store.get(repo, oid) !== undefined);
+  const haveSet = new Set(request.haves);
   const parts: Buffer[] = [];
   let shallow: string[] = [];
+  let unshallow: string[] = [];
   let objects = new Map<string, GitObject>();
   if (wantedTips.length > 0) {
-    const walk = walkForFetch(store, repo, wantedTips, request.depth, haveSet);
-    shallow = walk.shallow;
-    objects = collectObjects(store, repo, walk.commits);
+    if (request.depth !== null) {
+      const boundaryTips = request.shallowBoundaries.filter((oid) => store.get(repo, oid) !== undefined);
+      const result = fetchObjects(store, repo, wantedTips, request.depth, request.haves, request.shallowBoundaries);
+      objects = result.objects;
+      shallow = result.shallow;
+      unshallow = boundaryTips.filter((oid) => commitParents(store, repo, oid) !== null);
+    } else {
+      const result = fetchObjects(store, repo, wantedTips, null, request.haves);
+      objects = result.objects;
+      shallow = result.shallow;
+    }
   }
   for (const oid of shallow) parts.push(pktText(`shallow ${oid}`));
+  for (const oid of unshallow) parts.push(pktText(`unshallow ${oid}`));
   parts.push(pktText('NAK'));
-  const pack = writePack(objects.values());
+  const pack = writePack([...objects.values()].map((object) => ({ type: object.type, data: object.data })));
   parts.push(sidebandFrames(pack));
   parts.push(pktLineFlush());
   return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-result' };

@@ -10,6 +10,7 @@ export interface RestContext {
   store: Store;
   scenario: Scenario;
   token: string;
+  authed?: boolean;
 }
 
 export interface RestReply {
@@ -145,7 +146,7 @@ function commitJson(repo: Repo, commitOid: string): Record<string, unknown> {
     sha: commitOid,
     node_id: Buffer.from(`commit:${commitOid}`).toString('base64'),
     commit: {
-      message: text.slice(messageAt + 2),
+      message: text.slice(messageAt + 2).replace(/\n$/, ''),
       author: { name: nameMatch?.[1]?.trim() ?? '', email: emailMatch?.[1] ?? '', date: new Date(epoch * 1000).toISOString() },
       committer: { name: nameMatch?.[1]?.trim() ?? '', email: emailMatch?.[1] ?? '', date: new Date(epoch * 1000).toISOString() },
       tree: { sha: text.slice(treeAt + 5, text.indexOf('\n', treeAt)) },
@@ -174,11 +175,21 @@ function queryOf(url: string): URLSearchParams {
 }
 
 /** Route a REST request. `path` is the /api/v3-relative pathname (no query). */
-export async function handleRest(ctx: RestContext, method: string, path: string, req: IncomingMessage, res: ServerResponse, rawUrl: string): Promise<RestReply> {
+export async function handleRest(ctx: RestContext, method: string, path: string, req: IncomingMessage, res: ServerResponse, rawUrl: string, rawBody?: Buffer): Promise<RestReply> {
   const { store, scenario } = ctx;
+  if (ctx.authed === false && path !== '/' && path !== '/meta') {
+    return jsonReply(401, { message: 'Requires authentication' }, { 'www-authenticate': 'Basic realm="GitHub"' });
+  }
   const owner = scenario.viewer.login;
   const segments = path.split('/').filter((segment) => segment !== '');
-  const body = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE' ? await readJson(req) : { ok: true, body: {}, raw: Buffer.alloc(0) };
+  const body = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE'
+    ? (rawBody !== undefined
+        ? ((): { ok: boolean; body: unknown; raw: Buffer } => {
+            if (rawBody.length === 0) return { ok: true, body: {}, raw: rawBody };
+            try { return { ok: true, body: JSON.parse(rawBody.toString('utf8')), raw: rawBody }; } catch { return { ok: false, body: null, raw: rawBody }; }
+          })()
+        : await readJson(req))
+    : { ok: true, body: {}, raw: Buffer.alloc(0) };
   if (!body.ok) return error(400, 'Problems parsing JSON');
 
   // ---- root and meta
@@ -206,6 +217,18 @@ export async function handleRest(ctx: RestContext, method: string, path: string,
     if (rest.length === 0 && method === 'GET') {
       return jsonReply(200, { login: store.identity.login, id: 1, name: store.identity.name, email: store.identity.email, type: 'User' });
     }
+    if (rest[0] === 'repos' && method === 'POST') {
+      const input = body.body as Record<string, unknown>;
+      const name = typeof input.name === 'string' && input.name !== '' ? input.name : '';
+      if (name === '') return error(422, 'Validation Failed: name is required');
+      if (store.getRepo(owner, name)) return error(422, 'name already exists on this account');
+      const repo = store.createRepo(name, {
+        description: typeof input.description === 'string' ? input.description : undefined,
+        private: input.private === true,
+        defaultBranch: typeof input.default_branch === 'string' ? input.default_branch : undefined,
+      });
+      return jsonReply(201, repoJson(repo));
+    }
     if (rest[0] === 'repos' && method === 'GET') {
       const query = queryOf(rawUrl);
       const perPage = Math.max(1, Math.min(100, Number(query.get('per_page') ?? 30) || 30));
@@ -218,8 +241,8 @@ export async function handleRest(ctx: RestContext, method: string, path: string,
         const nextUrl = `/api/v3/user/repos?per_page=${perPage}&page=${page + 1}`;
         const base = ((): string => {
           try {
-            const url = new URL(rawUrl, 'http://x');
-            return `${url.protocol}//${url.host}`;
+            const host = req.headers.host ?? '127.0.0.1';
+            return `http://${host}`;
           } catch {
             return '';
           }

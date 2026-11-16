@@ -44,8 +44,13 @@ export function parseTree(data: Uint8Array): TreeEntry[] {
 }
 
 export function buildTree(entries: ReadonlyArray<TreeEntry>): Buffer {
+  const sorted = [...entries].sort((a, b) => {
+    const an = a.mode === '40000' ? `${a.name}/` : a.name;
+    const bn = b.mode === '40000' ? `${b.name}/` : b.name;
+    return Buffer.from(an, 'utf8').compare(Buffer.from(bn, 'utf8'));
+  });
   const parts: Buffer[] = [];
-  for (const entry of entries) {
+  for (const entry of sorted) {
     parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
     parts.push(Buffer.from(entry.oid, 'hex'));
   }

@@ -58,6 +58,16 @@ const TOOLS: ToolSpec[] = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
+    name: 'get_repository',
+    description: 'Get a repository',
+    inputSchema: {
+      type: 'object',
+      properties: { owner: { type: 'string' }, repo: { type: 'string' } },
+      required: ['owner', 'repo'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'create_repository',
     description: 'Create a new GitHub repository',
     inputSchema: {
@@ -244,7 +254,7 @@ function num(args: Record<string, unknown>, key: string, fallback: number): numb
 function callTool(ctx: McpContext, name: string, args: Record<string, unknown>): { result?: Record<string, unknown>; invalid?: string } {
   const { store } = ctx;
   const spec = TOOLS.find((entry) => entry.name === name);
-  if (spec === undefined) return { result: errorResult(`Unknown tool: ${name}`) };
+  if (spec === undefined) return { invalid: `Unknown tool: ${name}` };
   if (args === undefined || args === null || typeof args !== 'object') return { invalid: 'Invalid params: arguments must be an object' };
   const missing = requireArgs(args, (spec.inputSchema.required as readonly string[]) ?? []);
   if (missing !== null) return { invalid: `Invalid params: ${missing}` };
@@ -254,6 +264,12 @@ function callTool(ctx: McpContext, name: string, args: Record<string, unknown>):
     case 'get_me': {
       const me = { login: store.identity.login, id: 1, name: store.identity.name, email: store.identity.email };
       return { result: contentResult(JSON.stringify(me), me) };
+    }
+    case 'get_repository': {
+      const repo = store.getRepo(str(args, 'owner'), str(args, 'repo'));
+      if (repo === undefined) return { result: errorResult('Repository not found') };
+      const summary = { name: repo.name, full_name: `${repo.owner}/${repo.name}`, private: repo.private, default_branch: repo.defaultBranch, description: repo.description };
+      return { result: contentResult(JSON.stringify(summary), summary) };
     }
     case 'create_repository': {
       const repoName = str(args, 'name');
@@ -410,7 +426,7 @@ function callTool(ctx: McpContext, name: string, args: Record<string, unknown>):
       return { result: contentResult(JSON.stringify(listing), { files: listing }) };
     }
     default:
-      return { result: errorResult(`Unknown tool: ${name}`) };
+      return { invalid: `Unknown tool: ${name}` };
   }
 }
 

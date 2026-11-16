@@ -236,7 +236,7 @@ export class Store {
    * `changes` maps full path to blob oid, or null to delete. Existing tree content at untouched
    * paths is preserved from `baseTreeOid` (null for an empty base).
    */
-  buildTreeRecursive(baseTreeOid: string | null, changes: Map<string, string | null>): string | null {
+  buildTreeRecursive(repo: Repo, baseTreeOid: string | null, changes: Map<string, string | null>): string | null {
     interface Node {
       files: Map<string, string>;
       dirs: Map<string, Node>;
@@ -294,13 +294,13 @@ export class Store {
       }
     }
 
-    const build = (node: Node): string | null => {
+    const build = (node: Node, isRoot: boolean): string | null => {
       const entries: TreeEntry[] = [];
       for (const [name, oid] of [...node.files].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
         entries.push({ mode: '100644', name, oid });
       }
       for (const [name, child] of [...node.dirs].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-        const oid = build(child);
+        const oid = build(child, false);
         if (oid === null) continue;
         entries.push({ mode: '40000', name, oid });
       }
@@ -310,10 +310,10 @@ export class Store {
         if (!object) continue;
         entries.push({ mode: object.type === 'tree' ? '40000' : '100644', name, oid });
       }
-      if (entries.length === 0) return null;
+      if (entries.length === 0 && !isRoot) return null;
       return this.put(repo, 'tree', buildTree(entries));
     };
-    return build(root);
+    return build(root, true);
   }
 
   /**
@@ -338,7 +338,7 @@ export class Store {
     let parentCommitOid: string | null = null;
     if (parentOid !== null) parentCommitOid = this.peelCommit(repo, parentOid);
     const baseTreeOid = parentCommitOid !== null ? parseCommit(repo.objects.get(parentCommitOid)!.data).tree : null;
-    const treeOid = this.buildTreeRecursive(baseTreeOid, new Map(changes));
+    const treeOid = this.buildTreeRecursive(repo, baseTreeOid, new Map(changes));
     if (treeOid === null) return null;
     const who = options.author ?? this.identity;
     const timestamp = Math.floor(Date.now() / 1000);
@@ -352,6 +352,7 @@ export class Store {
     });
     const commitOid = this.put(repo, 'commit', data);
     repo.refs.set(refName, commitOid);
+    if (branch === repo.defaultBranch || repo.refs.get('HEAD') === undefined) repo.refs.set('HEAD', commitOid);
     return { commitOid, treeOid };
   }
 
@@ -467,6 +468,7 @@ export class Store {
     });
     const sha = this.put(repo, 'commit', data);
     repo.refs.set(baseRef, sha);
+    if (baseBranch === repo.defaultBranch || repo.refs.get('HEAD') === undefined) repo.refs.set('HEAD', sha);
     return { sha };
   }
 
@@ -622,4 +624,3 @@ function commitTimestampFrom(view: ReturnType<typeof parseCommit>): number {
   return match ? Number(match[1]) : 0;
 }
 
-}

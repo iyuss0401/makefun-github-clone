@@ -88,7 +88,7 @@ export function createApp(options: AppOptions = {}): Server {
           const v2 = new URL(req.url ?? '/', 'http://forge').searchParams.get('v2') !== null
             || String(req.headers['git-protocol'] ?? '').includes('version=2');
           const reply = infoRefs(store, repo, service === 'git-receive-pack' ? 'git-receive-pack' : 'git-upload-pack', v2);
-          res.writeHead(reply.status, reply.headers);
+          res.writeHead(reply.status, { 'content-type': reply.contentType, 'cache-control': 'no-cache' });
           res.end(reply.body);
           return;
         }
@@ -126,7 +126,7 @@ export function createApp(options: AppOptions = {}): Server {
           sendJson(res, 400, { message: 'Problems parsing JSON' });
           return;
         }
-        const outcome = handleGraphQL({ store, scenario, token, authed }, payload);
+        const outcome = handleGraphQL({ store, scenario, token, authed, errors: [] }, payload);
         sendJson(res, outcome.status, outcome.body);
         return;
       }
@@ -165,7 +165,7 @@ export function createApp(options: AppOptions = {}): Server {
       // REST v3
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
         const sub = path.slice('/api/v3'.length) || '/';
-        const reply = await handleRest({ store, scenario, token }, method, sub, req, res, req.url ?? '/');
+        const reply = await handleRest({ store, scenario, token, authed }, method, sub, req, res, req.url ?? '/', body);
         if (reply.raw) {
           res.writeHead(reply.status, { 'content-type': 'application/x-git-upload-pack-advertisement', ...(reply.headers ?? {}) });
           res.end(reply.body);
@@ -178,7 +178,7 @@ export function createApp(options: AppOptions = {}): Server {
       // Everything else, every method: GitHub's 404 body.
       sendJson(res, 404, { message: 'Not Found' });
     })().catch((error: unknown) => {
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error);
       if (!res.headersSent) sendJson(res, 500, { message: 'Server Error', detail });
       else res.end();
     });
