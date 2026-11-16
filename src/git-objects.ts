@@ -2,7 +2,7 @@
 // (node:zlib) and plain Buffer arithmetic — no git binary, no dependencies.
 
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, deflateSync, inflateSync } from 'node:zlib';
 
 export type GitObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 
@@ -298,72 +298,60 @@ export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
   return result;
 }
 
-/** Incremental zlib inflate that reports exactly how many input bytes one deflate stream consumed. */
-function inflateOne(buffer: Buffer, offset: number): { data: Buffer; next: number } {
-  const zlib = require('node:zlib') as typeof import('node:zlib');
-  const infl = zlib.createInflate();
-  infl.write(buffer.subarray(offset));
-  infl.end();
-  const chunks: Buffer[] = [];
-  // Synchronous drain: Node's zlib runs deflate/inflate on the thread pool; for small objects this
-  // completes before end emits. To stay synchronous and exact, fall back to a byte-scan approach.
-  const full = inflateSync(buffer.subarray(offset));
-  chunks.push(full);
-  // Recompute consumed bytes: re-run a streaming inflate with tracking.
-  const tracker = zlib.createInflate();
-  let consumed = 0;
-  tracker.on('data', () => undefined);
-  // The simplest exact measure: feed bytes one at a time is too slow; instead find stream end by
-  // matching re-compressed prefix is unreliable. Use zlib's internal _processing flag is private.
-  // Given the forge only ever reads packs it wrote itself (no deltas sent) and client packs come
-  // from our own writePack, this path resolves the consumed length via re-deflate equality.
-  consumed = measureDeflateConsumed(buffer, offset);
-  return { data: chunks[0] as Buffer, next: offset + consumed };
-}
-
-function measureDeflateConsumed(buffer: Buffer, offset: number): number {
-  // Node's inflateSync consumes the entire buffer; we need the exact end of the first stream.
-  // Strategy: inflate incrementally with Z_SYNC_FLUSH chunking by feeding progressively larger
-  // prefixes through createInflate with end() and catching errors, binary-search is O(log n) but
-  // stream end detection: use zlib.inflateSync on prefix; a complete stream succeeds, a truncated
-  // one throws "unexpected end of file". Binary search for the smallest successful prefix.
-  let lo = 1;
-  let hi = buffer.length - offset;
-  // Complete streams succeed even with trailing garbage? inflateSync errors on trailing bytes? It
-  // returns what it can. Safer: use streaming inflate and read bytesWritten equivalents.
-  const zlib = require('node:zlib') as typeof import('node:zlib');
-  const infl = zlib.inflateSync(Buffer.from(buffer.subarray(offset)));
-  void infl;
-  // Determine consumed via createInflate + _events: use the stream's own accounting by feeding the
-  // whole buffer and reading how many input bytes were processed through the public 'bytesRead' of
-  // the underlying handle is unavailable. Use an incremental loop with inflateSync on prefixes.
-  const tryInflate = (end: number): Buffer | null => {
-    try {
-      return zlib.inflateSync(Buffer.from(buffer.subarray(offset, end)));
-    } catch {
-      return null;
-    }
-  };
-  // Exponential upper bound then binary search on the smallest prefix that inflates to full data.
-  const full = infl;
-  let end = hi;
-  let step = 1;
-  // find smallest end such that inflate succeeds AND output length == full.length
-  while (step < hi) step <<= 1;
-  lo = 0;
-  while (step > 0) {
-    const candidate = lo + step;
-    if (candidate <= hi) {
-      const result = tryInflate(candidate);
-      if (result !== null && result.length === full.length) {
-        hi = candidate;
-      } else {
-        lo = candidate;
+/**
+ * Inflate one zlib stream out of `buffer` starting at `offset`, reporting exactly how many input
+ * bytes the stream consumed. The pack reader needs the boundary to find the next entry. Node's zlib
+ * handles run on the thread pool, so this wraps the synchronous drain in a Promise; readPack awaits.
+ */
+function inflateOne(buffer: Buffer, offset: number): Promise<{ data: Buffer; next: number }> {
+  return new Promise((resolve, reject) => {
+    const infl = createInflate();
+    const chunks: Buffer[] = [];
+    let written = 0;
+    let ended = false;
+    infl.on('data', (chunk: Buffer) => chunks.push(chunk));
+    infl.on('error', reject);
+    const finish = (): void => {
+      resolve({ data: Buffer.concat(chunks), next: offset + written });
+    };
+    infl.on('end', () => {
+      ended = true;
+      // The stream is complete. zlib consumed every byte written before `end` fires; the tail of the
+      // final write beyond the stream is dropped by zlib itself, but `written` counts it. Trim by
+      // re-running inflateSync on the exact prefix: binary search is unnecessary because zlib stops
+      // reading at the stream's end and exposes the remainder via inflate's internal state; instead
+      // find the true end by re-inflating progressively shorter prefixes (log steps, cheap).
+      const total = written;
+      let lo = 1;
+      let hi = total;
+      // The stream ends at the smallest prefix that still inflates to the same full output.
+      const full = Buffer.concat(chunks);
+      const attempt = (end: number): Buffer | null => {
+        try {
+          return inflateSync(buffer.subarray(offset, offset + end));
+        } catch {
+          return null;
+        }
+      };
+      let step = 1;
+      while (step < hi) step <<= 1;
+      lo = 0;
+      while (step > 0) {
+        const candidate = lo + step;
+        if (candidate <= hi) {
+          const result = attempt(candidate);
+          if (result !== null && result.length === full.length) hi = candidate;
+          else lo = candidate;
+        }
+        step >>= 1;
       }
-    }
-    step >>= 1;
-  }
-  return hi;
+      written = hi;
+      finish();
+    });
+    infl.end(buffer.subarray(offset));
+    written = buffer.length - offset;
+    void ended;
+  });
 }
 
 export function packChecksum(pack: Uint8Array): string {
@@ -377,7 +365,7 @@ export function verifyPackChecksum(pack: Uint8Array): { ok: boolean; expected: s
   return { ok: actual === expected, expected, actual };
 }
 
-export function readPack(pack: Uint8Array): PackReadResult {
+export async function readPack(pack: Uint8Array): Promise<PackReadResult> {
   const buffer = Buffer.from(pack);
   if (buffer.length < 32) throw new Error(`pack is ${buffer.length} bytes, too short`);
   if (buffer.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
@@ -416,7 +404,7 @@ export function readPack(pack: Uint8Array): PackReadResult {
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
     }
-    const inflated = inflateOne(buffer, offset);
+    const inflated = await inflateOne(buffer, offset);
     if (inflated.data.length !== header.size) {
       throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
     }
