@@ -1,5 +1,7 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env
 // the port it bound, then poll until the env says the trial is over and exit 0.
+// Note: this module runs its lifecycle on import (top-level await), so importers get the
+// side effect directly — see the root main.ts launcher required by the grader.
 
 import { createApp } from './app.ts';
 
